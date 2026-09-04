@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+#这是LLaVA的多模态输入桥接层：负责将图片送进视觉编码器，得到视觉特征。将视觉特征投影到语言模型的隐藏维度。
 
 from abc import ABC, abstractmethod
 
@@ -25,7 +26,7 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 from llava.mm_utils import get_anyres_image_grid_shape
 
-
+#给基础语言模型添加视觉模块
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -40,21 +41,24 @@ class LlavaMetaModel:
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
 
+    #取出视觉编码器
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
 
+    #初始化或加载视觉模块，这个FSDP是指是否使用FSDP分布式训练
     def initialize_vision_modules(self, model_args, fsdp=None):
-        vision_tower = model_args.vision_tower
-        mm_vision_select_layer = model_args.mm_vision_select_layer
-        mm_vision_select_feature = model_args.mm_vision_select_feature
-        pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
-        mm_patch_merge_type = model_args.mm_patch_merge_type
+        vision_tower = model_args.vision_tower  #使用哪个视觉模块
+        mm_vision_select_layer = model_args.mm_vision_select_layer  #取视觉模型的哪一层输出
+        mm_vision_select_feature = model_args.mm_vision_select_feature  #从该层输出中选什么特征
+        pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter  #预训练好的projector权重文件路径
+        mm_patch_merge_type = model_args.mm_patch_merge_type  #多图片patch特征怎样合并
 
         self.config.mm_vision_tower = vision_tower
 
+        #如果当前模型还没有视觉编码器，则新建一个。
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
 
@@ -76,6 +80,7 @@ class LlavaMetaModel:
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
+        #保存图片特征的选取方式和合并方式
         if getattr(self, 'mm_projector', None) is None:
             self.mm_projector = build_vision_projector(self.config)
 
@@ -97,6 +102,7 @@ class LlavaMetaModel:
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
 
+#去掉补出来的无效边缘，目标是为图片适应模型输入。
 def unpad_image(tensor, original_size):
     """
     Unpads a PyTorch tensor of a padded and resized image.
@@ -128,6 +134,7 @@ def unpad_image(tensor, original_size):
     return unpadded_tensor
 
 
+#把图片插入文本序列
 class LlavaMetaForCausalLM(ABC):
 
     @abstractmethod
@@ -137,11 +144,13 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
+    #图片编码 输入image[batch_size]
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    #准备多模态输入（核心）
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None
@@ -209,6 +218,8 @@ class LlavaMetaForCausalLM(ABC):
         # it is a headache to deal with None all the time.
         # But it is not ideal, and if you have a better idea,
         # please open an issue / submit a PR, thanks.
+        
+        #把<image>替换成视觉token
         _labels = labels
         _position_ids = position_ids
         _attention_mask = attention_mask
@@ -226,15 +237,15 @@ class LlavaMetaForCausalLM(ABC):
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
 
-        new_input_embeds = []
-        new_labels = []
-        cur_image_idx = 0
+        new_input_embeds = []  #保存最终的“文本+图片”向量
+        new_labels = []  #保存更新后的训练标签
+        cur_image_idx = 0  #记录当前该使用第几张图片特征
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
+                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0) #没有图片占位符时，正常文本ID转为文本embedding
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
@@ -271,6 +282,7 @@ class LlavaMetaForCausalLM(ABC):
             new_labels.append(cur_new_labels)
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
+        #因图片变长后重新padding，因为会产生很多patch token，可能很长。这里读取最大长度限制
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
         if tokenizer_model_max_length is not None:
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
