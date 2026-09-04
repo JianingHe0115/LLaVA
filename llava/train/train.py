@@ -304,7 +304,8 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
     conversation += BEGIN_SIGNAL
     return conversation
 
-
+规范<image>所在位置
+#
 def preprocess_multimodal(
     sources: Sequence[str],
     data_args: DataArguments
@@ -689,6 +690,7 @@ class LazySupervisedDataset(Dataset):
             length_list.append(cur_len)
         return length_list
 
+    #这里是整个dataloader真正取得第i条数据的时候，用来处理图片样本
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
         if isinstance(i, int):
@@ -721,6 +723,17 @@ class LazySupervisedDataset(Dataset):
                 self.data_args)
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
+        #根据当前对话模板选择具体处理函数
+        '''
+        process()函数主要做的事情是：
+        conversations
+          ↓ 对话模板
+        Prompt 字符串
+          ↓ Tokenizer / tokenizer_image_token
+        input_ids
+          ↓ clone + mask
+        labels
+        '''
         data_dict = preprocess(
             sources,
             self.tokenizer,
@@ -748,6 +761,7 @@ class DataCollatorForSupervisedDataset(object):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
+        #padding
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
