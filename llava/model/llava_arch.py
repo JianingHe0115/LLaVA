@@ -297,10 +297,11 @@ class LlavaMetaForCausalLM(ABC):
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
 
+        #建立了三个空白结果容器
         new_input_embeds_padded = []
-        new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
-        position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
+        new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device) #全是-100
+        attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device) #全是0
+        position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device) #全是01.
 
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
