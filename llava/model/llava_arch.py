@@ -144,17 +144,22 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    #图片编码 输入image[batch_size]
+    #图片编码 输入image[batch_size，3，height，width]，输出[batch_size, num_patches, vision_hidden_size]
+    '''流程是：image -> self.get_model().get_vision_tower()(images) -> CLIP输出的视觉patch特征 -> self.get_model().mm_projector(image_features)
+    -> 与LLama hidden_size对齐的图像 embeddings 
+    '''
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
-    #准备多模态输入（核心）
+    #**准备多模态输入（核心）**  将<image>占位符换成真的patch embedding
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None
     ):
+        #典型的guard clause 早退、条件保护，含义是如果不需要多模态处理，就立即返回，不进入后面复杂的图像融合流程
+        # input_ids.shape[1] == 1 即当前输入长度只有一个 token。 因此，当 seq_len == 1 时，LLaVA 通常直接早退，避免每生成一个 token 都让 CLIP再处理一次同一张图片。
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
@@ -335,6 +340,7 @@ class LlavaMetaForCausalLM(ABC):
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
+    #向tokenizer加入图片特殊token
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
@@ -356,9 +362,13 @@ class LlavaMetaForCausalLM(ABC):
                 input_embeddings[-num_new_tokens:] = input_embeddings_avg
                 output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
+            #LLaVA 等多模态大模型在 第一阶段预训练（Pre-training / Feature Alignment 阶段）
+            #主要作用是：在训练投影层（mm_mlp_adapter）时，解冻输入 Embeddings 层（允许更新权重），同时冻结输出 Embeddings 层（禁止更新权重）。
             if model_args.tune_mm_mlp_adapter:
+                # 遍历输入 Embedding 层的参数，设置为可训练 (True)
                 for p in self.get_input_embeddings().parameters():
                     p.requires_grad = True
+                # 遍历输出 Embedding 层（LM Head / 词表输出层）的参数，设置为不可训练 (False)
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
 
