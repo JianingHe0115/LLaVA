@@ -1,8 +1,26 @@
+'''
+这里主要定义了LLaVA训练过程的定制逻辑，主要解决四件事：
+1. 如何按文本长度、模态（图片、纯文本）组织数据顺序
+2.如何为mm_projector单独设置学习率
+3.使用 deepspeed zero-3时，如何正确取回被切分的参数
+4.微调多模态adapter时，如何只保存必要权重
+
+和之前的文件衔接如下：
+LazySupervisedDataset
+    ↓ 产生单条数据
+DataCollatorForSupervisedDataset
+    ↓ 拼成 batch
+LLaVATrainer
+    ↓ 决定 batch 的取样顺序、优化器、checkpoint 保存策略
+LLaVA 模型
+    ↓ 前向传播、loss、反向传播
+'''
+
 import os
 import torch
 import torch.nn as nn
 
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler #sampler类的作用是决定数据集中的样本应该以什么顺序被dataloader取出
 
 from transformers import Trainer
 from transformers.trainer import (
@@ -14,7 +32,7 @@ from transformers.trainer import (
 )
 from typing import List, Optional
 
-
+#从DeepSpeed ZeRO-3中取回完整参
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
@@ -28,13 +46,13 @@ def maybe_zero_3(param, ignore_status=False, name=None):
         param = param.detach().cpu().clone()
     return param
 
-
+#只收集多模态adapter相关参数
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
     to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
     return to_return
 
-
+#按长度尽量均衡地分给不同GPU
 def split_to_even_chunks(indices, lengths, num_chunks):
     """
     Split a list of indices into `chunks` chunks of roughly equal lengths.
@@ -57,6 +75,10 @@ def split_to_even_chunks(indices, lengths, num_chunks):
     return chunks
 
 
+#先区分图文/纯文本，再按长度分组。它利用了之前 LazySupervisedDataset.modality_lengths 的约定：
+#正数：有图的多模态样本
+#负数：无图的纯文本样本
+#绝对值：样本文本的大致长度
 def get_modality_length_grouped_indices(lengths, batch_size, world_size, generator=None):
     # We need to use torch for the random part as a distributed sampler will set the random seed for torch.
     assert all(l != 0 for l in lengths), "Should not have zero length."
@@ -85,6 +107,7 @@ def get_modality_length_grouped_indices(lengths, batch_size, world_size, generat
     return [i for megabatch in megabatches for i in megabatch]
 
 
+#随机后按长度相近分组。尽量让同一个训练batch 的序列长度相近，减少padding，从而节省显存和计算。
 def get_length_grouped_indices(lengths, batch_size, world_size, generator=None, merge=True):
     # We need to use torch for the random part as a distributed sampler will set the random seed for torch.
     indices = torch.randperm(len(lengths), generator=generator)
@@ -96,6 +119,7 @@ def get_length_grouped_indices(lengths, batch_size, world_size, generator=None, 
     return [i for megabatch in megabatches for batch in megabatch for i in batch]
 
 
+#将上面的索引逻辑包装成pytorch sampler
 class LengthGroupedSampler(Sampler):
     r"""
     Sampler that samples indices in a way that groups together features of the dataset of roughly the same length while
@@ -130,8 +154,10 @@ class LengthGroupedSampler(Sampler):
         return iter(indices)
 
 
+#定制HF trainer
 class LLaVATrainer(Trainer):
 
+    #决定数据取样顺序
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
@@ -147,6 +173,7 @@ class LLaVATrainer(Trainer):
         else:
             return super()._get_train_sampler()
 
+    #创建优化器与参数组
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -227,6 +254,7 @@ class LLaVATrainer(Trainer):
 
         return self.optimizer
 
+    #保存训练checkpoint
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -248,6 +276,7 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 
+    #保存最终模型
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             pass
