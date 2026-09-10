@@ -157,7 +157,7 @@ class LengthGroupedSampler(Sampler):
 #定制HF trainer
 class LLaVATrainer(Trainer):
 
-    #决定数据取样顺序
+    #决定数据取样顺序,自定义训练sampler
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
@@ -235,10 +235,10 @@ class LLaVATrainer(Trainer):
                     },
                 ]
 
-            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args) #从HF配置取优化器类别和参数
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-            if optimizer_cls.__name__ == "Adam8bit":
+            if optimizer_cls.__name__ == "Adam8bit":  #让embedding保持32-bit优化状态
                 import bitsandbytes
 
                 manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
